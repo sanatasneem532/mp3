@@ -1,0 +1,13 @@
+
+# Compiled executables
+birthday
+birthday_test
+birthday_bf
+birthday_bf_asan
+birthday_bf_tsan
+
+# Debug symbol folders
+*.dSYM/
+
+# Local testing scripts
+stress_test.py
