@@ -1,7 +1,10 @@
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -9,15 +12,58 @@
 
 #define INF LLONG_MAX
 
+// ============================================================
+// DATA STRUCTURES
+// ============================================================
+
 typedef struct {
   int *neighbors;
   size_t count;
   size_t capacity;
 } AdjList;
 
-// Read and validate an integer safely.
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  size_t waiting;
+  size_t total;
+  unsigned long long generation;
+} Barrier;
+
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  int released;
+  int abort;
+} LaunchGate;
+
+typedef struct {
+  AdjList *adj;
+
+  int start;
+  int end;
+  int thread_id;
+
+  long long *dist;
+  long long *new_dist;
+
+  int *thread_updated;
+  int *stop;
+
+  Barrier *start_barrier;
+  Barrier *done_barrier;
+
+  LaunchGate *gate;
+
+} ThreadArgs;
+
+// ============================================================
+// INPUT HANDLING
+// ============================================================
+
 // Returns 1 on success, 0 on EOF, -1 on invalid input.
 int read_int(int *value) {
+
   char token[128];
   char *end;
 
@@ -26,19 +72,26 @@ int read_int(int *value) {
   }
 
   errno = 0;
+
   intmax_t num = strtoimax(token, &end, 10);
 
   if (errno == ERANGE || end == token || *end != '\0' || num < INT_MIN ||
       num > INT_MAX) {
+
     return -1;
   }
 
   *value = (int)num;
+
   return 1;
 }
 
-// Free the entire adjacency list
+// ============================================================
+// GRAPH MEMORY MANAGEMENT
+// ============================================================
+
 void free_graph(AdjList *adj, int V) {
+
   if (adj == NULL) {
     return;
   }
@@ -52,6 +105,7 @@ void free_graph(AdjList *adj, int V) {
 
 // Add v as a neighbor of u.
 // Returns 1 on success, 0 on failure.
+
 int add_neighbor(AdjList *adj, int u, int v) {
 
   if (adj[u].count == adj[u].capacity) {
@@ -59,7 +113,9 @@ int add_neighbor(AdjList *adj, int u, int v) {
     size_t new_capacity;
 
     if (adj[u].capacity == 0) {
+
       new_capacity = 2;
+
     } else {
 
       if (adj[u].capacity > SIZE_MAX / 2) {
@@ -88,126 +144,499 @@ int add_neighbor(AdjList *adj, int u, int v) {
   return 1;
 }
 
-// Sequential Bellman-Ford algorithm.
-// Returns 1 on success, 0 on allocation failure.
+// ============================================================
+// BARRIER IMPLEMENTATION
+// ============================================================
 
-int bellman_ford(AdjList *adj, int V, int N, long long **result) {
+int barrier_init(Barrier *b, size_t total) {
 
-  // Check allocation size
-  if ((size_t)V > SIZE_MAX / sizeof(long long)) {
+  b->waiting = 0;
+  b->total = total;
+  b->generation = 0;
+
+  if (pthread_mutex_init(&b->mutex, NULL) != 0) {
     return 0;
   }
 
-  // Allocate two distance arrays
+  if (pthread_cond_init(&b->cond, NULL) != 0) {
+
+    pthread_mutex_destroy(&b->mutex);
+
+    return 0;
+  }
+
+  return 1;
+}
+
+void barrier_wait(Barrier *b) {
+
+  pthread_mutex_lock(&b->mutex);
+
+  unsigned long long current_generation = b->generation;
+
+  b->waiting++;
+
+  if (b->waiting == b->total) {
+
+    b->waiting = 0;
+    b->generation++;
+
+    pthread_cond_broadcast(&b->cond);
+
+  } else {
+
+    while (current_generation == b->generation) {
+
+      pthread_cond_wait(&b->cond, &b->mutex);
+    }
+  }
+
+  pthread_mutex_unlock(&b->mutex);
+}
+
+void barrier_destroy(Barrier *b) {
+
+  pthread_cond_destroy(&b->cond);
+  pthread_mutex_destroy(&b->mutex);
+}
+
+// ============================================================
+// LAUNCH GATE
+// ============================================================
+
+int launch_gate_init(LaunchGate *gate) {
+
+  gate->released = 0;
+  gate->abort = 0;
+
+  if (pthread_mutex_init(&gate->mutex, NULL) != 0) {
+    return 0;
+  }
+
+  if (pthread_cond_init(&gate->cond, NULL) != 0) {
+
+    pthread_mutex_destroy(&gate->mutex);
+
+    return 0;
+  }
+
+  return 1;
+}
+
+void release_workers(LaunchGate *gate, int abort) {
+
+  pthread_mutex_lock(&gate->mutex);
+
+  gate->abort = abort;
+  gate->released = 1;
+
+  pthread_cond_broadcast(&gate->cond);
+
+  pthread_mutex_unlock(&gate->mutex);
+}
+
+void launch_gate_destroy(LaunchGate *gate) {
+
+  pthread_cond_destroy(&gate->cond);
+  pthread_mutex_destroy(&gate->mutex);
+}
+
+// ============================================================
+// WORKER THREAD FUNCTION
+// ============================================================
+
+void *worker_function(void *arg) {
+
+  ThreadArgs *args = (ThreadArgs *)arg;
+
+  // Wait until all threads have been created.
+
+  pthread_mutex_lock(&args->gate->mutex);
+
+  while (!args->gate->released) {
+
+    pthread_cond_wait(&args->gate->cond, &args->gate->mutex);
+  }
+
+  int abort = args->gate->abort;
+
+  pthread_mutex_unlock(&args->gate->mutex);
+
+  if (abort) {
+    return NULL;
+  }
+
+  // Process Bellman-Ford iterations.
+
+  while (1) {
+
+    // Wait for main thread to start the iteration.
+
+    barrier_wait(args->start_barrier);
+
+    // Check whether execution should stop.
+
+    if (*args->stop) {
+      break;
+    }
+
+    // Process only assigned destination vertices.
+
+    for (int v = args->start; v < args->end; v++) {
+
+      long long best = args->dist[v];
+
+      // Examine all neighbours of destination v.
+
+      for (size_t j = 0; j < args->adj[v].count; j++) {
+
+        int u = args->adj[v].neighbors[j];
+
+        // Skip unreachable neighbours.
+
+        if (args->dist[u] == INF) {
+          continue;
+        }
+
+        // Every edge has weight 1.
+
+        long long candidate = args->dist[u] + 1;
+
+        // Relaxation.
+
+        if (candidate < best) {
+          best = candidate;
+        }
+      }
+
+      // Write only to our assigned destination.
+
+      args->new_dist[v] = best;
+
+      // Record whether this thread found an update.
+
+      if (best < args->dist[v]) {
+        args->thread_updated[args->thread_id] = 1;
+      }
+    }
+
+    // Wait until all workers finish their calculations.
+
+    barrier_wait(args->done_barrier);
+  }
+
+  return NULL;
+}
+
+// ============================================================
+// MULTITHREADED BELLMAN-FORD
+// ============================================================
+
+int bellman_ford(AdjList *adj, int V, int N, int T, long long **result) {
+
+  // Check allocation-size overflow.
+
+  if ((size_t)V > SIZE_MAX / sizeof(long long) ||
+      (size_t)T > SIZE_MAX / sizeof(pthread_t) ||
+      (size_t)T > SIZE_MAX / sizeof(ThreadArgs) ||
+      (size_t)T > SIZE_MAX / sizeof(int)) {
+
+    return 0;
+  }
+
+  // Allocate distance arrays.
+
   long long *dist = malloc((size_t)V * sizeof(long long));
+
   long long *new_dist = malloc((size_t)V * sizeof(long long));
 
-  if (dist == NULL || new_dist == NULL) {
+  // Allocate thread-related arrays.
+
+  pthread_t *threads = malloc((size_t)T * sizeof(pthread_t));
+
+  ThreadArgs *args = malloc((size_t)T * sizeof(ThreadArgs));
+
+  int *thread_updated = calloc((size_t)T, sizeof(int));
+
+  // Check allocations.
+
+  if (dist == NULL || new_dist == NULL || threads == NULL || args == NULL ||
+      thread_updated == NULL) {
+
     free(dist);
     free(new_dist);
+    free(threads);
+    free(args);
+    free(thread_updated);
+
     return 0;
   }
 
-  // Initialize distances
+  // Initialize distances.
+
   for (int i = 0; i < V; i++) {
+
     dist[i] = INF;
     new_dist[i] = INF;
   }
 
-  // Source distance is zero
   dist[N] = 0;
 
-  // Bellman-Ford: at most V-1 iterations
+  // Shared stop flag.
+
+  int stop = 0;
+
+  // Initialize launch gate.
+
+  LaunchGate gate;
+
+  if (!launch_gate_init(&gate)) {
+    goto allocation_failure;
+  }
+
+  // Initialize barriers.
+
+  Barrier start_barrier;
+  Barrier done_barrier;
+
+  if (!barrier_init(&start_barrier, (size_t)T + 1)) {
+
+    launch_gate_destroy(&gate);
+
+    goto allocation_failure;
+  }
+
+  if (!barrier_init(&done_barrier, (size_t)T + 1)) {
+
+    barrier_destroy(&start_barrier);
+    launch_gate_destroy(&gate);
+
+    goto allocation_failure;
+  }
+
+  // Create worker threads.
+
+  int created = 0;
+
+  for (int i = 0; i < T; i++) {
+
+    // Divide vertices evenly among threads.
+
+    int base = V / T;
+    int remainder = V % T;
+
+    int start = i * base + (i < remainder ? i : remainder);
+
+    int end = start + base + (i < remainder ? 1 : 0);
+
+    // Initialize thread arguments.
+
+    args[i].adj = adj;
+
+    args[i].start = start;
+    args[i].end = end;
+
+    args[i].thread_id = i;
+
+    args[i].dist = dist;
+    args[i].new_dist = new_dist;
+
+    args[i].thread_updated = thread_updated;
+
+    args[i].stop = &stop;
+
+    args[i].start_barrier = &start_barrier;
+    args[i].done_barrier = &done_barrier;
+
+    args[i].gate = &gate;
+
+    // Create thread.
+
+    if (pthread_create(&threads[i], NULL, worker_function, &args[i]) != 0) {
+
+      fprintf(stderr, "Error: Could not create thread %d\n", i);
+
+      // Release already-created threads without entering barriers.
+
+      release_workers(&gate, 1);
+
+      for (int j = 0; j < created; j++) {
+        pthread_join(threads[j], NULL);
+      }
+
+      barrier_destroy(&start_barrier);
+      barrier_destroy(&done_barrier);
+
+      launch_gate_destroy(&gate);
+
+      goto allocation_failure;
+    }
+
+    created++;
+  }
+
+  // All threads have been created.
+  // Allow workers to begin.
+
+  release_workers(&gate, 0);
+
+  // ========================================================
+  // BELLMAN-FORD ITERATIONS
+  // ========================================================
+
   for (int iter = 0; iter < V - 1; iter++) {
 
-    // Initially assume no changes
-    int updated = 0;
+    // Copy previous iteration distances.
 
-    // Copy previous distances into new distances
     for (int i = 0; i < V; i++) {
       new_dist[i] = dist[i];
     }
 
-    // Calculate distances for every destination vertex
-    for (int v = 0; v < V; v++) {
+    // Reset update flags.
 
-      // Examine all neighbours of destination v
-      for (size_t j = 0; j < adj[v].count; j++) {
+    for (int i = 0; i < T; i++) {
+      thread_updated[i] = 0;
+    }
 
-        int u = adj[v].neighbors[j];
+    // Release all workers.
 
-        // Ignore unreachable neighbours
-        if (dist[u] == INF) {
-          continue;
-        }
+    barrier_wait(&start_barrier);
 
-        // Every edge has weight 1
-        long long candidate = dist[u] + 1;
+    // Wait for all workers to finish.
 
-        // Relaxation
-        if (candidate < new_dist[v]) {
-          new_dist[v] = candidate;
-          updated = 1;
-        }
+    barrier_wait(&done_barrier);
+
+    // Check whether any thread updated a distance.
+
+    int updated = 0;
+
+    for (int i = 0; i < T; i++) {
+
+      if (thread_updated[i]) {
+
+        updated = 1;
+        break;
       }
     }
 
-    // Swap the arrays
+    // Swap the distance arrays.
+
     long long *temp = dist;
+
     dist = new_dist;
     new_dist = temp;
 
-    // Stop if no distances changed
+    // Update pointers for the next iteration.
+
+    for (int i = 0; i < T; i++) {
+
+      args[i].dist = dist;
+      args[i].new_dist = new_dist;
+    }
+
+    // Early termination.
+
     if (!updated) {
       break;
     }
   }
 
-  // Free the unused array
-  free(new_dist);
+  // ========================================================
+  // STOP WORKER THREADS
+  // ========================================================
 
-  // Return final distances
+  stop = 1;
+
+  // Release workers so they can observe the stop flag.
+
+  barrier_wait(&start_barrier);
+
+  // Wait for all workers to exit.
+
+  for (int i = 0; i < T; i++) {
+    pthread_join(threads[i], NULL);
+  }
+
+  // Destroy synchronization objects.
+
+  barrier_destroy(&start_barrier);
+  barrier_destroy(&done_barrier);
+
+  launch_gate_destroy(&gate);
+
+  // Free unused memory.
+
+  free(new_dist);
+  free(threads);
+  free(args);
+  free(thread_updated);
+
+  // Return final distances.
+
   *result = dist;
 
   return 1;
+
+allocation_failure:
+
+  free(dist);
+  free(new_dist);
+  free(threads);
+  free(args);
+  free(thread_updated);
+
+  return 0;
 }
+
+// ============================================================
+// MAIN
+// ============================================================
 
 int main(void) {
 
   int V, E, N, T;
 
-  // 1. Read graph parameters
+  // Read graph parameters.
+
   if (read_int(&V) != 1 || read_int(&E) != 1 || read_int(&N) != 1 ||
       read_int(&T) != 1) {
 
     fprintf(stderr, "Error: Invalid or incomplete graph parameters\n");
+
     return 1;
   }
 
-  // 2. Validate graph parameters
+  // Validate parameters.
+
   if (V <= 0 || E < 0 || T <= 0 || N < 0 || N >= V) {
 
     fprintf(stderr, "Error: Invalid input parameters\n");
+
     return 1;
   }
 
-  // 3. Check allocation-size overflow
+  // Check allocation-size overflow.
+
   if ((size_t)V > SIZE_MAX / sizeof(AdjList)) {
 
     fprintf(stderr, "Error: Graph is too large\n");
+
     return 1;
   }
 
-  // 4. Allocate adjacency list
+  // Allocate adjacency list.
+
   AdjList *adj = calloc((size_t)V, sizeof(AdjList));
 
   if (adj == NULL) {
 
     fprintf(stderr, "Error: Memory allocation failed\n");
+
     return 1;
   }
 
-  // 5. Read edges and construct bidirectional adjacency list
+  // Read edges and construct bidirectional adjacency list.
+
   for (int i = 0; i < E; i++) {
 
     int u, v;
@@ -217,24 +646,29 @@ int main(void) {
       fprintf(stderr, "Error: Invalid or incomplete edge %d\n", i + 1);
 
       free_graph(adj, V);
+
       return 1;
     }
 
-    // Validate endpoints
+    // Validate endpoints.
+
     if (u < 0 || u >= V || v < 0 || v >= V) {
 
       fprintf(stderr, "Error: Invalid vertex in edge %d\n", i + 1);
 
       free_graph(adj, V);
+
       return 1;
     }
 
-    // Add edge in both directions
+    // Add edge in both directions.
+
     if (!add_neighbor(adj, u, v)) {
 
       fprintf(stderr, "Error: Memory allocation failed\n");
 
       free_graph(adj, V);
+
       return 1;
     }
 
@@ -243,11 +677,13 @@ int main(void) {
       fprintf(stderr, "Error: Memory allocation failed\n");
 
       free_graph(adj, V);
+
       return 1;
     }
   }
 
-  // 6. Check for unexpected extra input
+  // Reject unexpected extra input.
+
   char extra;
 
   if (scanf(" %c", &extra) == 1) {
@@ -255,22 +691,25 @@ int main(void) {
     fprintf(stderr, "Error: Unexpected extra input\n");
 
     free_graph(adj, V);
+
     return 1;
   }
 
-  // 7. Run sequential Bellman-Ford
+  // Run multithreaded Bellman-Ford.
+
   long long *dist = NULL;
 
-  if (!bellman_ford(adj, V, N, &dist)) {
+  if (!bellman_ford(adj, V, N, T, &dist)) {
 
-    fprintf(stderr, "Error: Memory allocation failed\n");
+    fprintf(stderr, "Error: Bellman-Ford execution failed\n");
 
     free_graph(adj, V);
+
     return 1;
   }
 
-  // 8. Print shortest distances
-  // Use -1 for unreachable vertices
+  // Print ONLY the shortest distances.
+  // Use -1 for unreachable vertices.
 
   for (int i = 0; i < V; i++) {
 
@@ -287,7 +726,8 @@ int main(void) {
 
   printf("\n");
 
-  // 9. Free allocated memory
+  // Free all memory
+
   free(dist);
   free_graph(adj, V);
 
