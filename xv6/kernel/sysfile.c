@@ -407,6 +407,34 @@ sys_mknod(void)
 }
 
 uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH]; //#Buffers for target and symlink paths
+  struct inode *ip;                    //#Inode pointer for the new symlink
+  int len;                             //#Length of target string
+
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0) //#Fetch target and path arguments
+    return -1; //#Return error if arguments are invalid
+
+  begin_op(); //#Begin file system transaction
+  if ((ip = create(path, T_SYMLINK, 0, 0)) == 0) { //#Create new inode of type T_SYMLINK
+    end_op(); //#End transaction on create failure
+    return -1; //#Return error if file creation failed
+  }
+
+  len = strlen(target); //#Get target path string length
+  if (writei(ip, 0, (uint64)target, 0, len) != len) { //#Write target path to symlink inode
+    iunlockput(ip); //#Unlock and release inode on write failure
+    end_op(); //#End transaction on failure
+    return -1; //#Return error on write failure
+  }
+
+  iunlockput(ip); //#Unlock and release inode
+  end_op(); //#Commit file system transaction
+  return 0; //#Return success
+}
+
+uint64
 sys_chdir(void)
 {
   char path[MAXPATH];
