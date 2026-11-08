@@ -309,6 +309,8 @@ sys_open(void)
   struct file *f;
   struct inode *ip;
   int n;
+  int depth = 0;              //#Symlink recursion depth counter
+  char target[MAXPATH];       //#Buffer for symlink target path
 
   argint(1, &omode);
   if ((n = argstr(0, path, MAXPATH)) < 0)
@@ -319,8 +321,17 @@ sys_open(void)
   if (omode & O_CREATE) {
     ip = create(path, T_FILE, 0, 0);
     if (ip == 0) {
-      end_op();
-      return -1;
+      if (!(omode & O_NOFOLLOW) && (ip = namei(path)) != 0) { //#Path might be an existing symlink
+        ilock(ip); //#Lock existing inode
+        if (ip->type != T_SYMLINK) { //#If not a symlink, create failure is real
+          iunlockput(ip); //#Release inode
+          end_op(); //#End transaction
+          return -1; //#Return error
+        }
+      } else {
+        end_op();
+        return -1;
+      }
     }
   } else {
     if ((ip = namei(path)) == 0) {
@@ -328,11 +339,54 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if (ip->type == T_DIR && omode != O_RDONLY) {
-      iunlockput(ip);
-      end_op();
-      return -1;
+  }
+
+  if (!(omode & O_NOFOLLOW)) { //#Follow symlinks unless O_NOFOLLOW is specified
+    while (ip->type == T_SYMLINK) { //#Follow chain of symlinks
+      if (depth >= 10) { //#Prevent infinite loops by capping depth at 10
+        iunlockput(ip); //#Release symlink inode on cycle/depth limit
+        end_op(); //#End transaction
+        return -1; //#Return error
+      }
+      int len = readi(ip, 0, (uint64)target, 0, MAXPATH - 1); //#Read target from symlink data
+      if (len < 0) { //#Check read error
+        iunlockput(ip); //#Release inode on read failure
+        end_op(); //#End transaction
+        return -1; //#Return error
+      }
+      target[len] = '\0'; //#Null-terminate target path
+      iunlockput(ip); //#Release current symlink inode
+
+      depth++; //#Increment depth
+      if (omode & O_CREATE) { //#If O_CREATE is set, target may need creation
+        ip = create(target, T_FILE, 0, 0); //#Attempt to open or create target
+        if (ip == 0) { //#Target may be an existing symlink or invalid
+          if ((ip = namei(target)) != 0) { //#Look up target
+            ilock(ip); //#Lock target inode
+            if (ip->type != T_SYMLINK) { //#Non-symlink failure
+              iunlockput(ip); //#Release inode
+              end_op(); //#End transaction
+              return -1; //#Return error
+            }
+          } else { //#Target lookup failed
+            end_op(); //#End transaction
+            return -1; //#Return error
+          }
+        }
+      } else {
+        if ((ip = namei(target)) == 0) { //#Look up target inode
+          end_op(); //#End transaction on dangling symlink
+          return -1; //#Return error
+        }
+        ilock(ip); //#Lock target inode
+      }
     }
+  }
+
+  if (ip->type == T_DIR && omode != O_RDONLY) { //#Directories can only be opened read-only
+    iunlockput(ip); //#Release directory inode
+    end_op(); //#End transaction
+    return -1; //#Return error
   }
 
   if (ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)) {
