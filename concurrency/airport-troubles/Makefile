@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -pthread -O3
-TARGET = airport
+TARGET = airport-troubles
 
 all: $(TARGET)
 

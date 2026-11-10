@@ -20,8 +20,8 @@ Every entity in the airport is modeled as an independent POSIX thread:
 
 ### Compilation & Execution
 ```bash
-gcc -Wall -Wextra -pthread -o airport concurrency/airport-troubles/main.c
-./airport < input.txt
+gcc -Wall -Wextra -pthread -o airport-troubles concurrency/airport-troubles/main.c
+./airport-troubles < input.txt
 ```
 
 ---
@@ -29,7 +29,7 @@ gcc -Wall -Wextra -pthread -o airport concurrency/airport-troubles/main.c
 ## 2. Birthday Boy (`concurrency/birthday-boy`)
 
 ### Parallel Bellman-Ford Implementation
-- Vertices $[0, V - 1]$ are partitioned evenly across $T$ worker threads.
+- Vertices $[0, V - 1]$ are partitioned evenly across $T$ worker threads and weight of each edge is assumed to be 1.
 - In each iteration $k \in [0, V - 2]$, each thread computes the updated shortest distances for its assigned slice of destination vertices by inspecting incoming edges from adjacent vertices.
 - **Race-Free Design**: Distance arrays are double-buffered (`dist` and `new_dist`). Worker threads only read from `dist` and write exclusively to their assigned slice in `new_dist`.
 - **Barrier Synchronization**: Two-phase barrier synchronization synchronizes rounds across threads and enables early termination when no updates occur across an entire round.
@@ -75,6 +75,11 @@ We evaluated parallel speedup and scalability by fixing the graph dimensions ($V
    - **Work Grain Size**: For $V = 2000$ and $T = 32$, each thread is responsible for only $\approx 62$ vertices per round. The computational work per slice is too small to outweigh thread coordination and context-switching overheads (Amdahl's Law).
    - **Cache Line Contention / False Sharing**: Multiple threads reading adjacent entries in the global distance arrays can cause cache invalidations across CPU cores, reducing memory bus efficiency.
 
+### Compilation & Execution
+```bash
+gcc -Wall -Wextra -pthread -o birthday-boy concurrency/birthday-boy/main.c
+./birthday-boy < input.txt
+```
 ---
 
 ## 3. Symbolic Links in xv6 (`xv6/`)
