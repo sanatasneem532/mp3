@@ -5,9 +5,16 @@ birthday_test
 birthday_bf
 birthday_bf_asan
 birthday_bf_tsan
+bf_timed
 
 # Debug symbol folders
 *.dSYM/
 
 # Local testing scripts
 stress_test.py
+
+bellman_ford_timed.c
+bench.py
+fit2.json
+results2.json
+

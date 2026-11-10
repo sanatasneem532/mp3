@@ -36,49 +36,85 @@ gcc -Wall -Wextra -pthread -o airport-troubles concurrency/airport-troubles/main
 
 ---
 
-## Performance Analysis Report
 
-### 1. Runtime vs. Number of Vertices ($V$)
+## Performance Analysis
 
-To analyze algorithmic scalability, we measured the execution runtime as a function of the number of vertices $V$ with $E = 4V$ for a fixed thread count $T = 4$. For each data point, the runtime was averaged over multiple independently generated random graph topologies to eliminate structural variance.
+### 1. Runtime vs. Number of Vertices (V)
 
-The theoretical time complexity of Bellman-Ford is:
-$$\mathcal{O}(V \cdot E)$$
+To analyse how the runtime of the parallel Bellman-Ford algorithm varies with the number of vertices, experiments were conducted by varying V while keeping the number of threads fixed at T = 4.
 
-We modeled the expected complexity as:
-$$T_{\text{expected}}(V) = k \cdot V \cdot E$$
+For every combination of V and E, multiple graphs with different edge sets were tested, and the runtime was averaged to obtain representative measurements.
 
-Using linear least-squares regression across empirical data points, the optimal constant of proportionality was determined to be:
-$$k \approx 9.73 \times 10^{-11} \text{ seconds / (vertex} \times \text{edge)}$$
+The theoretical time complexity of Bellman-Ford is O(VE), since the algorithm performs up to V-1 iterations, examining all E edges in each iteration.
 
-![Runtime vs Vertices](plots/runtime_vs_V.png)
+Therefore, the theoretical runtime is represented by:
 
-#### Analysis:
-- The empirical runtime closely tracks the theoretical $k \cdot V \cdot E$ trajectory.
-- As the graph size increases, each iteration requires inspecting all incident edges $\sum_{u} \deg(u) = 2E$, and the maximum number of iterations scales with graph diameter (bounded by $V - 1$).
-- Minor discrepancies at smaller graph sizes are due to fixed setup costs (memory allocation, thread spawning, and barrier initialization) that are amortized over larger graph instances.
+\[
+T_{\text{theoretical}} = kVE
+\]
+
+The experimentally fitted constant is:
+
+**k = 6.49 × 10⁻¹²**
+
+An additional reference curve, k'(V + E)log₂V, is plotted for comparison, where:
+
+**k' = 1.60 × 10⁻⁹**
+
+![Runtime vs Vertices](concurrency/birthday-boy/runtime_vs_V.png)
+
+**Observations:**
+
+- The empirical runtime generally increases as the number of vertices increases.
+- The theoretical kVE curve represents the expected growth in computational work.
+- The empirical measurements do not perfectly match the theoretical curve because actual execution time is also affected by thread scheduling, synchronization and memory-access overhead.
+- For smaller graphs, fixed overheads form a larger proportion of the total execution time.
+- As the graph size increases, the computational work becomes more significant.
+
+### 2. Runtime vs. Number of Threads (T)
+
+To analyse the effect of parallelism, the number of threads was varied while keeping the graph size fixed at:
+
+- **Number of vertices (V):** 2000
+- **Number of edges (E):** 8000
+
+For each thread count, multiple graphs with different edge sets were tested, and the runtime was averaged.
+
+The system has 10 physical CPU cores, represented by the vertical dotted line in the plot.
+
+![Runtime vs Threads](concurrency/birthday-boy/runtime_vs_threads.png)
+
+**Observations:**
+
+- Initially, increasing the number of threads reduces runtime because the workload is distributed across multiple threads.
+- Beyond a certain point, adding more threads increases runtime instead of improving performance.
+- This happens because each iteration requires synchronization between worker threads using barriers. All workers must finish their assigned work before the next iteration can begin.
+- Creating and managing additional threads also introduces scheduling and context-switching overhead.
+- The system has 10 physical CPU cores. When the number of threads exceeds the available physical cores, threads compete for CPU resources, potentially increasing execution time.
+- For this graph size, the overhead of managing additional threads outweighs the benefits of parallel execution.
+
+**Conclusion:**
+
+The experiment demonstrates that increasing the number of threads does not necessarily improve performance. Parallelism initially reduces execution time, but synchronization and scheduling overhead eventually dominate.
+
+The optimal number of threads depends on the graph size, workload and available hardware resources.
+
+### 3. Overall Conclusion
+
+The experiments demonstrate that:
+
+- Runtime increases with graph size, consistent with the theoretical O(VE) complexity of Bellman-Ford.
+- Increasing the number of threads can improve performance initially.
+- Excessive parallelism introduces synchronization, scheduling and thread-management overhead.
+- Efficient parallel execution requires balancing the workload against the number of available CPU cores.
+
 
 ---
-
-### 2. Runtime vs. Number of Threads ($T$)
-
-We evaluated parallel speedup and scalability by fixing the graph dimensions ($V = 2000, E = 8000$) and varying the number of threads $T \in [1, 2, 4, 8, 12, 16, 24, 32]$. Runtimes were averaged across multiple random graph topologies for each thread count.
-
-![Runtime vs Threads](plots/runtime_vs_threads.png)
-
-#### Observations & Discussion:
-1. **Initial Speedup ($T = 1 \to 2$)**:
-   - Transitioning from single-threaded execution to 2 threads yields a measurable speedup as the relaxation workload across the $V$ vertices is divided among concurrent physical CPU cores.
-2. **Diminishing Returns & Synchronization Bottleneck ($T \ge 4$)**:
-   - Beyond a small number of threads, the runtime plateaus and gradually increases.
-   - **Barrier Synchronization Overhead**: In parallel Bellman-Ford, all $T$ threads must synchronize at a barrier after each relaxation round. With $V - 1$ possible rounds, threads spend more time contending for mutexes and condition variables inside `pthread_barrier_wait` than performing useful edge relaxation.
-   - **Work Grain Size**: For $V = 2000$ and $T = 32$, each thread is responsible for only $\approx 62$ vertices per round. The computational work per slice is too small to outweigh thread coordination and context-switching overheads (Amdahl's Law).
-   - **Cache Line Contention / False Sharing**: Multiple threads reading adjacent entries in the global distance arrays can cause cache invalidations across CPU cores, reducing memory bus efficiency.
 
 ### Compilation & Execution
 ```bash
 gcc -Wall -Wextra -pthread -o birthday-boy concurrency/birthday-boy/main.c
-./birthday-boy < input.txt
+./birthday-boy
 ```
 ---
 
